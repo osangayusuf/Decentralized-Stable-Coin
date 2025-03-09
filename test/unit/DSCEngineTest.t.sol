@@ -11,7 +11,7 @@ import {ERC20Mock} from
 import {AggregatorV3Interface} from "@chainlink/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol";
 import {OracleLib} from "src/libraries/OracleLib.sol";
 import {MockV3Aggregator} from "../mocks/MockV3Aggregator.sol";
-import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {WrappedToken} from "src/interfaces/WrappedToken.sol";
 
 using OracleLib for AggregatorV3Interface;
 
@@ -34,6 +34,7 @@ contract DSCEngineTest is Test {
     uint256 private constant LIQUIDATION_BONUS = 10;
     uint256 private constant PRICE_PRECISION = 1e18;
     uint256 private constant ADDITIONAL_FEED_PRECISION = 1e10;
+
     uint256 private ethPrice;
 
     function setUp() public {
@@ -45,6 +46,10 @@ contract DSCEngineTest is Test {
         if (block.chainid == 11_155_111) {
             vm.deal(USER, STARTING_BALANCE);
             vm.deal(LIQUIDATOR, STARTING_BALANCE);
+            vm.prank(USER);
+            WrappedToken(weth).deposit{value: STARTING_BALANCE}();
+            vm.prank(LIQUIDATOR);
+            WrappedToken(weth).deposit{value: STARTING_BALANCE}();
         } else {
             ERC20Mock(weth).mint(USER, STARTING_BALANCE);
             ERC20Mock(weth).mint(LIQUIDATOR, STARTING_BALANCE);
@@ -104,10 +109,10 @@ contract DSCEngineTest is Test {
     }
 
     function testUserCanDepositCollateral() public {
-        uint256 expectedBalance = DEPOSIT_AMOUNT * 2000;
+        uint256 expectedBalance = (DEPOSIT_AMOUNT * ethPrice * ADDITIONAL_FEED_PRECISION) / PRICE_PRECISION;
 
         vm.startPrank(USER);
-        IERC20(weth).approve(address(engine), DEPOSIT_AMOUNT);
+        WrappedToken(weth).approve(address(engine), DEPOSIT_AMOUNT);
         engine.depositCollateral(weth, DEPOSIT_AMOUNT);
         vm.stopPrank();
 
@@ -117,7 +122,7 @@ contract DSCEngineTest is Test {
 
     function testEmitCollateralDepositedEvent() public {
         vm.startPrank(USER);
-        IERC20(weth).approve(address(engine), DEPOSIT_AMOUNT);
+        WrappedToken(weth).approve(address(engine), DEPOSIT_AMOUNT);
 
         vm.expectEmit();
         emit DSCEngine.CollateralDeposited(USER, weth, DEPOSIT_AMOUNT);
@@ -135,7 +140,7 @@ contract DSCEngineTest is Test {
 
     modifier userHasDepositedAndMinted() {
         vm.startPrank(USER);
-        IERC20(weth).approve(address(engine), DEPOSIT_AMOUNT);
+        WrappedToken(weth).approve(address(engine), DEPOSIT_AMOUNT);
         engine.depositCollateral(weth, DEPOSIT_AMOUNT);
         engine.mintDSC(MINT_AMOUNT);
         vm.stopPrank();
@@ -147,7 +152,7 @@ contract DSCEngineTest is Test {
     //////////////////////
     function testUserCanMintDSC() public {
         vm.startPrank(USER);
-        IERC20(weth).approve(address(engine), DEPOSIT_AMOUNT);
+        WrappedToken(weth).approve(address(engine), DEPOSIT_AMOUNT);
         engine.depositCollateral(weth, DEPOSIT_AMOUNT);
 
         engine.mintDSC(MINT_AMOUNT);
@@ -168,7 +173,7 @@ contract DSCEngineTest is Test {
     ////////////////////////
     function testUserCanBurnDSC() public {
         vm.startPrank(USER);
-        IERC20(weth).approve(address(engine), DEPOSIT_AMOUNT);
+        WrappedToken(weth).approve(address(engine), DEPOSIT_AMOUNT);
         engine.depositCollateral(weth, DEPOSIT_AMOUNT);
 
         engine.mintDSC(MINT_AMOUNT);
@@ -186,7 +191,7 @@ contract DSCEngineTest is Test {
     ///////////////////////////////
     function testUserCanRedeemCollateral() public {
         vm.startPrank(USER);
-        IERC20(weth).approve(address(engine), DEPOSIT_AMOUNT);
+        WrappedToken(weth).approve(address(engine), DEPOSIT_AMOUNT);
         engine.depositCollateral(weth, DEPOSIT_AMOUNT);
         engine.mintDSC(MINT_AMOUNT);
 
@@ -200,7 +205,7 @@ contract DSCEngineTest is Test {
 
     function testRevertIfRedeemingMoreCollateralThanDeposited() public {
         vm.startPrank(USER);
-        IERC20(weth).approve(address(engine), DEPOSIT_AMOUNT);
+        WrappedToken(weth).approve(address(engine), DEPOSIT_AMOUNT);
         engine.depositCollateral(weth, DEPOSIT_AMOUNT);
 
         uint256 amountToRedeem = DEPOSIT_AMOUNT * 2;
@@ -233,18 +238,20 @@ contract DSCEngineTest is Test {
     ///////////////////////////
     function testUserCanBeLiquidated() public liquidatorIsFunded {
         vm.startPrank(USER);
-        IERC20(weth).approve(address(engine), DEPOSIT_AMOUNT);
+        WrappedToken(weth).approve(address(engine), DEPOSIT_AMOUNT);
         engine.depositCollateral(weth, DEPOSIT_AMOUNT);
 
         engine.mintDSC(MINT_AMOUNT * 3);
 
         // Simulate a price drop to make the user undercollateralized
-        // vm.mockCall(
-        //     ethUsdPriceFeed,
-        //     abi.encodeWithSelector(AggregatorV3Interface.latestRoundData.selector),
-        //     abi.encode(0, 1000 * 1e8, 0, 0, 0) // Price drops to $1000
-        // );
-        MockV3Aggregator(ethUsdPriceFeed).updateAnswer(1000 * 1e8);
+        vm.mockCall(
+            ethUsdPriceFeed,
+            abi.encodeWithSelector(AggregatorV3Interface.latestRoundData.selector),
+            abi.encode(type(uint80).max, 1000 * 1e8, (block.timestamp - 1), block.timestamp, type(uint80).max) // Price drops to $1000
+            // (uint80 roundId, int256 answer, uint256 startedAt, uint256 updatedAt, uint80 answeredInRound) =
+
+        );
+        // MockV3Aggregator(ethUsdPriceFeed).updateAnswer(1000 * 1e8);
 
         vm.stopPrank();
 
@@ -258,13 +265,13 @@ contract DSCEngineTest is Test {
         engine.liquidate(USER, weth, debtToCover);
         vm.stopPrank();
 
-        uint256 liquidatorCollateralBalance = IERC20(weth).balanceOf(LIQUIDATOR);
+        uint256 liquidatorCollateralBalance = WrappedToken(weth).balanceOf(LIQUIDATOR);
         assertEq(liquidatorCollateralBalance, expectedLiquidatorBalance);
     }
 
     function testRevertIfLiquidatingUserWithOkayHealthFactor() public {
         vm.startPrank(USER);
-        IERC20(weth).approve(address(engine), DEPOSIT_AMOUNT);
+        WrappedToken(weth).approve(address(engine), DEPOSIT_AMOUNT);
         engine.depositCollateral(weth, DEPOSIT_AMOUNT);
 
         engine.mintDSC(MINT_AMOUNT);
@@ -277,7 +284,7 @@ contract DSCEngineTest is Test {
 
     modifier liquidatorIsFunded() {
         vm.startPrank(LIQUIDATOR);
-        IERC20(weth).approve(address(engine), DEPOSIT_AMOUNT);
+        WrappedToken(weth).approve(address(engine), DEPOSIT_AMOUNT);
         engine.depositCollateral(weth, DEPOSIT_AMOUNT);
 
         engine.mintDSC(MINT_AMOUNT * 2);
